@@ -39,12 +39,6 @@ def clean_value(value):
 
 
 def normalize_phone(phone):
-    """
-    Exemples:
-    0661150488 -> 212661150488
-    00212661150488 -> 212661150488
-    212661150488 -> 212661150488
-    """
     value = clean_value(phone)
     if not value:
         return None
@@ -68,10 +62,6 @@ def normalize_phone(phone):
 
     return value
 
-
-# =========================
-# SALESFORCE
-# =========================
 
 def get_salesforce_token():
     url = "https://login.salesforce.com/services/oauth2/token"
@@ -124,10 +114,6 @@ def update_case_special_true(access_token: str, instance_url: str, case_id: str)
     response.raise_for_status()
 
 
-# =========================
-# VALIDATION
-# =========================
-
 def validate_record(record: dict):
     missing_fields = []
 
@@ -153,10 +139,6 @@ def validate_record(record: dict):
 
     return True, ""
 
-
-# =========================
-# INFOBIP
-# =========================
 
 def build_template_payload(record: dict):
     to_number = normalize_phone(record.get("Telephone__c"))
@@ -188,7 +170,7 @@ def build_template_payload(record: dict):
 
 def send_whatsapp_template(record: dict):
     if not SEND_WHATSAPP:
-        return True, {
+        return False, {
             "mode": "test",
             "message": "Envoi désactivé (SEND_WHATSAPP=false)"
         }
@@ -213,10 +195,6 @@ def send_whatsapp_template(record: dict):
 
     return False, data
 
-
-# =========================
-# GOOGLE SHEETS
-# =========================
 
 def init_google_sheet():
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
@@ -260,10 +238,6 @@ def save_report_to_sheets(report: dict):
 
     sheet.append_row(row)
 
-
-# =========================
-# MAIN
-# =========================
 
 def main():
     print(f"[{now_utc()}] Cron job started")
@@ -310,6 +284,22 @@ def main():
             continue
 
         success, response_data = send_whatsapp_template(record)
+
+        if not SEND_WHATSAPP:
+            report["failed_count"] += 1
+            report["failed_infobip_count"] += 1
+            report["failed"].append({
+                "case_id": case_id,
+                "case_number": case_number,
+                "telephone_raw": raw_phone,
+                "telephone_normalized": normalized_phone,
+                "name": record.get("NomComplet__c"),
+                "status": "not_sent",
+                "reason_type": "test_mode_no_send",
+                "reason": "Mode test actif : aucun message envoyé",
+                "infobip_response": response_data,
+            })
+            continue
 
         if success:
             try:
