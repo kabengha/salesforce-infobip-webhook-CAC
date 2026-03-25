@@ -1,7 +1,10 @@
 import os
 import json
 import requests
+import gspread
 from datetime import datetime, UTC
+from google.oauth2.service_account import Credentials
+
 
 SF_CLIENT_ID = os.getenv("SF_CLIENT_ID")
 SF_CLIENT_SECRET = os.getenv("SF_CLIENT_SECRET")
@@ -15,10 +18,60 @@ INFOBIP_SENDER = os.getenv("INFOBIP_SENDER")
 INFOBIP_TEMPLATE_NAME = os.getenv("INFOBIP_TEMPLATE_NAME", "afma_cac")
 INFOBIP_TEMPLATE_LANGUAGE = os.getenv("INFOBIP_TEMPLATE_LANGUAGE", "fr")
 
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Rapport WhatsApp CAC")
+GOOGLE_SHEET_WORKSHEET = os.getenv("GOOGLE_SHEET_WORKSHEET", "Logs")
+GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
+
+SEND_WHATSAPP = os.getenv("SEND_WHATSAPP", "false").lower() == "true"
+
 
 def now_utc():
     return datetime.now(UTC).isoformat()
 
+
+def clean_value(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "" or text.lower() == "null":
+        return None
+    return text
+
+
+def normalize_phone(phone):
+    """
+    Exemples:
+    0661150488 -> 212661150488
+    00212661150488 -> 212661150488
+    212661150488 -> 212661150488
+    """
+    value = clean_value(phone)
+    if not value:
+        return None
+
+    value = value.replace(" ", "").replace("-", "")
+
+    if value.startswith("00"):
+        value = value[2:]
+
+    if value.startswith("0"):
+        value = "212" + value[1:]
+
+    if not value.isdigit():
+        return None
+
+    if not value.startswith("212"):
+        return None
+
+    if len(value) < 11 or len(value) > 15:
+        return None
+
+    return value
+
+
+# =========================
+# SALESFORCE
+# =========================
 
 def get_salesforce_token():
     url = "https://login.salesforce.com/services/oauth2/token"
@@ -29,6 +82,7 @@ def get_salesforce_token():
         "username": SF_USERNAME,
         "password": SF_PASSWORD + SF_SECURITY_TOKEN,
     }
+
     response = requests.post(url, data=payload, timeout=30)
     response.raise_for_status()
     return response.json()
@@ -52,45 +106,31 @@ def fetch_cases(access_token: str, instance_url: str):
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
     }
+
     response = requests.get(url, headers=headers, params={"q": soql}, timeout=30)
     response.raise_for_status()
     return response.json()
 
 
-def normalize_phone(phone: str | None) -> str | None:
-    if not phone:
-        return None
+def update_case_special_true(access_token: str, instance_url: str, case_id: str):
+    url = f"{instance_url}/services/data/v59.0/sobjects/Case/{case_id}"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {"Special__c": True}
 
-    value = str(phone).strip().replace(" ", "").replace("-", "")
-
-    if value.lower() == "null":
-        return None
-
-    if value.startswith("00"):
-        value = value[2:]
-
-    if value.startswith("0"):
-        value = "212" + value[1:]
-
-    if not value.isdigit():
-        return None
-
-    if not value.startswith("212"):
-        return None
-
-    return value
+    response = requests.patch(url, headers=headers, json=payload, timeout=30)
+    response.raise_for_status()
 
 
-def clean_value(value):
-    if value is None:
-        return None
-    text = str(value).strip()
-    if text == "" or text.lower() == "null":
-        return None
-    return text
-
+# =========================
+# VALIDATION
+# =========================
 
 def validate_record(record: dict):
+    missing_fields = []
+
     required_fields = {
         "NomComplet__c": "Nom complet manquant",
         "marqueVehicule__c": "Marque véhicule manquante",
@@ -100,16 +140,23 @@ def validate_record(record: dict):
         "IDPolice__c": "ID Police manquant",
     }
 
-    for field, reason in required_fields.items():
+    for field, label in required_fields.items():
         if clean_value(record.get(field)) is None:
-            return False, reason
+            missing_fields.append(label)
 
     normalized_phone = normalize_phone(record.get("Telephone__c"))
     if not normalized_phone:
-        return False, "Téléphone invalide"
+        missing_fields.append("Téléphone invalide")
+
+    if missing_fields:
+        return False, " | ".join(missing_fields)
 
     return True, ""
 
+
+# =========================
+# INFOBIP
+# =========================
 
 def build_template_payload(record: dict):
     to_number = normalize_phone(record.get("Telephone__c"))
@@ -140,6 +187,12 @@ def build_template_payload(record: dict):
 
 
 def send_whatsapp_template(record: dict):
+    if not SEND_WHATSAPP:
+        return True, {
+            "mode": "test",
+            "message": "Envoi désactivé (SEND_WHATSAPP=false)"
+        }
+
     url = f"{INFOBIP_BASE_URL}/whatsapp/1/message/template"
     headers = {
         "Authorization": f"App {INFOBIP_API_KEY}",
@@ -161,24 +214,51 @@ def send_whatsapp_template(record: dict):
     return False, data
 
 
-def update_case_special_true(access_token: str, instance_url: str, case_id: str):
-    url = f"{instance_url}/services/data/v59.0/sobjects/Case/{case_id}"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-    payload = {"Special__c": True}
+# =========================
+# GOOGLE SHEETS
+# =========================
 
-    response = requests.patch(url, headers=headers, json=payload, timeout=30)
-    response.raise_for_status()
+def init_google_sheet():
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+
+    creds = Credentials.from_service_account_file(
+        GOOGLE_SERVICE_ACCOUNT_FILE,
+        scopes=scope
+    )
+
+    client = gspread.authorize(creds)
+    sheet = client.open(GOOGLE_SHEET_NAME).worksheet(GOOGLE_SHEET_WORKSHEET)
+    return sheet
 
 
-def save_daily_report(report: dict):
-    date_str = datetime.now(UTC).strftime("%Y-%m-%d")
-    filename = f"report_{date_str}.json"
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+def save_report_to_sheets(report: dict):
+    sheet = init_google_sheet()
 
+    details_json = json.dumps({
+        "sent": report["sent"],
+        "failed": report["failed"]
+    }, ensure_ascii=False)
+
+    row = [
+        report["date"],
+        report["total_cases"],
+        report["sent_count"],
+        report["failed_count"],
+        report["failed_missing_or_invalid_count"],
+        report["failed_infobip_count"],
+        report["failed_salesforce_update_count"],
+        details_json
+    ]
+
+    sheet.append_row(row)
+
+
+# =========================
+# MAIN
+# =========================
 
 def main():
     print(f"[{now_utc()}] Cron job started")
@@ -195,6 +275,9 @@ def main():
         "total_cases": len(records),
         "sent_count": 0,
         "failed_count": 0,
+        "failed_missing_or_invalid_count": 0,
+        "failed_infobip_count": 0,
+        "failed_salesforce_update_count": 0,
         "sent": [],
         "failed": [],
     }
@@ -202,14 +285,21 @@ def main():
     for record in records:
         case_id = record.get("Id")
         case_number = record.get("CaseNumber")
+        raw_phone = record.get("Telephone__c")
+        normalized_phone = normalize_phone(raw_phone)
 
         is_valid, reason = validate_record(record)
         if not is_valid:
             report["failed_count"] += 1
+            report["failed_missing_or_invalid_count"] += 1
             report["failed"].append({
                 "case_id": case_id,
                 "case_number": case_number,
-                "telephone": record.get("Telephone__c"),
+                "telephone_raw": raw_phone,
+                "telephone_normalized": normalized_phone,
+                "name": record.get("NomComplet__c"),
+                "status": "not_sent",
+                "reason_type": "missing_or_invalid_data",
                 "reason": reason,
             })
             continue
@@ -223,39 +313,45 @@ def main():
                 report["sent"].append({
                     "case_id": case_id,
                     "case_number": case_number,
-                    "telephone": normalize_phone(record.get("Telephone__c")),
+                    "telephone_raw": raw_phone,
+                    "telephone_normalized": normalized_phone,
                     "name": record.get("NomComplet__c"),
                     "status": "sent",
                     "infobip_response": response_data,
                 })
             except Exception as e:
                 report["failed_count"] += 1
+                report["failed_salesforce_update_count"] += 1
                 report["failed"].append({
                     "case_id": case_id,
                     "case_number": case_number,
-                    "telephone": record.get("Telephone__c"),
+                    "telephone_raw": raw_phone,
+                    "telephone_normalized": normalized_phone,
+                    "name": record.get("NomComplet__c"),
+                    "status": "not_sent",
+                    "reason_type": "salesforce_update_error",
                     "reason": f"Message envoyé mais échec MAJ Salesforce: {str(e)}",
                     "infobip_response": response_data,
                 })
         else:
             report["failed_count"] += 1
+            report["failed_infobip_count"] += 1
             report["failed"].append({
                 "case_id": case_id,
                 "case_number": case_number,
-                "telephone": record.get("Telephone__c"),
+                "telephone_raw": raw_phone,
+                "telephone_normalized": normalized_phone,
+                "name": record.get("NomComplet__c"),
+                "status": "not_sent",
+                "reason_type": "infobip_error",
                 "reason": "Erreur Infobip",
                 "infobip_response": response_data,
             })
 
-    save_daily_report(report)
+    save_report_to_sheets(report)
 
-    print(json.dumps({
-        "date": report["date"],
-        "total_cases": report["total_cases"],
-        "sent_count": report["sent_count"],
-        "failed_count": report["failed_count"],
-    }, ensure_ascii=False))
-
+    print("===== RAPPORT JOURNALIER =====")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
     print(f"[{now_utc()}] Cron job finished")
 
 
