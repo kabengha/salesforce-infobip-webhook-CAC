@@ -20,7 +20,7 @@ INFOBIP_TEMPLATE_LANGUAGE = os.getenv("INFOBIP_TEMPLATE_LANGUAGE", "fr")
 
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Rapport WhatsApp CAC")
 GOOGLE_SHEET_WORKSHEET = os.getenv("GOOGLE_SHEET_WORKSHEET", "Logs")
-GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 SEND_WHATSAPP = os.getenv("SEND_WHATSAPP", "false").lower() == "true"
 
@@ -219,13 +219,18 @@ def send_whatsapp_template(record: dict):
 # =========================
 
 def init_google_sheet():
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise ValueError("La variable d'environnement GOOGLE_SERVICE_ACCOUNT_JSON est manquante.")
+
     scope = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
 
-    creds = Credentials.from_service_account_file(
-        GOOGLE_SERVICE_ACCOUNT_FILE,
+    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+
+    creds = Credentials.from_service_account_info(
+        creds_dict,
         scopes=scope
     )
 
