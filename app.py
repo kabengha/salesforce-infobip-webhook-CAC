@@ -96,7 +96,7 @@ def fetch_cases(access_token: str, instance_url: str):
         "FROM Case "
         "WHERE Origin = 'CAC' "
         "AND RecordTypeId = '01268000000kfEaAAI' "
-        "AND CreatedDate >= 2026-03-18T00:00:00Z "
+        "AND CreatedDate >= 2026-03-19T00:00:00Z "
         "AND Special__c = false "
         "ORDER BY CreatedDate DESC"
     )
