@@ -2,3 +2,5 @@ Flask
 gunicorn
 requests
 python-dotenv
+gspread
+google-auth
